@@ -8,7 +8,7 @@ input to the NN is an N x N x (MT + L) image stack that represents state
 
     architecture:
 deep learning network takes board positions (s) as input,
-and outputs a vector of move probalities (p) with components p_a = Pr(a|s) for each action a,
+and outputs a vector of move probabilities (p) with components p_a = Pr(a|s) for each action a,
 and a scalar value (v) estimating the expected outcome (z) from position s: v ~= E[z|s].
 alphazero learns these move probabilities and value estimates entirely from self play.
 

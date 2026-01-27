@@ -1,4 +1,6 @@
-class Node:
-    def __init__(self, state, children=[]):
-        self.state = state
-        self.children = children
+from board import *
+
+'''
+reference: https://github.com/suragnair/alpha-zero-general/blob/master/MCTS.py
+
+'''
