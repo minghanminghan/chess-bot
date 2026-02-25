@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv init --no-readme)",
+      "Bash(uv add torch numpy python-chess tqdm)",
+      "Bash(uv run python -c \"import chess, torch, numpy, tqdm; print\\(''torch'', torch.__version__\\); print\\(''chess'', chess.__version__\\); print\\(''numpy'', numpy.__version__\\); print\\(''all imports OK''\\)\")",
+      "Bash(uv run python -c \":*)"
+    ]
+  }
+}

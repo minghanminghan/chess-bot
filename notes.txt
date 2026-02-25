@@ -1,0 +1,41 @@
+alphazero paper: https://arxiv.org/pdf/1712.01815
+    board representation:
+input to the NN is an N x N x (MT + L) image stack that represents state
+- image stack: 8 x 8 x (14 x 8 + 7) = 8 x 8 x 119
+- each set of planes represents the board position at time t-T+1, ..., t
+- plane is set to 0 for time-steps less than 1
+- board is oriented to the perspective of the current player
+
+    architecture:
+deep learning network takes board positions (s) as input,
+and outputs a vector of move probabilities (p) with components p_a = Pr(a|s) for each action a,
+and a scalar value (v) estimating the expected outcome (z) from position s: v ~= E[z|s].
+alphazero learns these move probabilities and value estimates entirely from self play.
+
+    move search
+alphazero uses a general-purpose MCTS algorithm.
+each search consists of a series of simulated games of self-play that traverse a tree from root s_root to leaf.
+each simulation proceeds by selecting in each state (s) a move (a) with:
+- low visit count
+- high move probability
+- high value
+- (averaged over leaf states of simulations that selected a from s)
+the search returns a vector (pi) representing a probability distribution over moves
+(either proportionally or greedily wrt the visit counts at the root state)
+
+    training
+alphazero is trained by self-play reinforcement leraning, starting from randomly initialized parameters (theta).
+games are played by selecting moves for both players by MCTS, a_t ~ pi_t.
+at the end of the game, the terminal position s_T is scored to compute the game outcome z:
+- -1 = loss
+- 0 = draw
+- 1 = win
+theta is updated to minimize the error between the predicted outcome v_t and the game outcome z,
+and to maximize the similarity of the policy vector p_t to the search probabilities pi_t.
+- theta is adjusted by GD on a loss function (l) that sums over MSE and cross-entropy losses resp.
+- NN: (p, v) = f_theta(s)
+- Loss: l = (z - v)^2 - pi^T log(p) + c*||theta||^2
+    - c is a parameter controlling the level of L2 weight regularization
+
+
+    stockfish docs: https://official-stockfish.github.io/docs/nnue-pytorch-wiki/docs/nnue.html
