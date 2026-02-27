@@ -19,11 +19,12 @@ chess-bot/
 ├── Arena.py                # model evaluation: (player1, player2, game) → (w, l, d)
 ├── Coach.py                # self-play training loop
 ├── utils.py                # AverageMeter, dotdict
-├── train.py                # 100k-step training entry point (do NOT auto-run)
-├── tui.py                  # [planned] Textual TUI: replay PGN + play vs bot
-├── uci_engine.py           # [planned] UCI protocol wrapper for cutechess-cli
-├── elo.py                  # [planned] cutechess-cli ELO evaluation helper
-└── pyproject.toml          # uv: torch, python-chess, numpy, tqdm
+├── train.py                # training entry point; CLI args for Colab use
+├── train_colab.ipynb       # Google Colab notebook (clone → Drive mount → train)
+├── tui.py                  # Textual TUI: replay PGN + play vs bot
+├── uci_engine.py           # UCI protocol wrapper for cutechess-cli
+├── elo.py                  # cutechess-cli ELO evaluation helper
+└── pyproject.toml          # uv: torch, python-chess, numpy, tqdm, textual
 ```
 
 ### Key Design Decisions
@@ -52,13 +53,20 @@ chess-bot/
 
 ---
 
-## Phase 2 — Strength Testing (PLANNED)
+## Phase 2 — Strength Testing (COMPLETE)
+
+| # | File | Status | Verified by |
+|---|------|--------|-------------|
+| 10 | `tui.py` | ✅ | `import tui` OK; replay + play modes implemented |
+| 11 | `uci_engine.py` | ✅ | `uci\nquit` → `uciok`; `position startpos\ngo` → `bestmove g1f3` (legal) |
+| 12 | `elo.py` | ✅ | `import elo` OK; `--dry-run` prints cutechess-cli command |
+
+### Colab training adaptation
 
 | # | File | Status | Description |
 |---|------|--------|-------------|
-| 10 | `tui.py` | ⬜ | Textual TUI: replay PGN + live play vs bot, auto-save PGN |
-| 11 | `uci_engine.py` | ⬜ | UCI stdin/stdout wrapper so bot works with cutechess-cli |
-| 12 | `elo.py` | ⬜ | Shell out to cutechess-cli, stream results, print ELO estimate |
+| 13 | `train.py` (edit) | ✅ | Added `argparse`: `--checkpoint-dir`, `--resume`, `--num-iters`, `--num-eps`, `--mcts-sims`, `--num-channels`, `--num-res-blocks` |
+| 14 | `train_colab.ipynb` | ✅ | Colab notebook: git clone → Drive mount → GPU check → train → download checkpoint |
 
 ---
 

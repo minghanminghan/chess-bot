@@ -6,15 +6,17 @@ Approximate step count:
   = 100,000 self-play episodes  (~100k "steps")
 
 Usage:
-  uv run python train.py
+  uv run python train.py                          # fresh run, local checkpoints
+  uv run python train.py --resume                 # resume from best.pth.tar
+  uv run python train.py --checkpoint-dir /path   # e.g. Google Drive path in Colab
+  uv run python train.py --num-iters 5 --num-eps 5 --mcts-sims 25 \
+      --num-channels 64 --num-res-blocks 4        # fast scale-down test
 
-Checkpoints are saved to ./checkpoints/ after each accepted model update.
-Training examples are saved to ./checkpoints/checkpoint_<iter>.examples.
-
-To resume from a checkpoint:
-  Set RESUME=True below, ensure best.pth.tar exists in ./checkpoints/.
+Checkpoints are saved to ./checkpoints/ (or --checkpoint-dir) after each accepted
+model update. Training examples are saved as checkpoint_<iter>.examples.
 """
 
+import argparse
 import os
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
@@ -62,8 +64,27 @@ args = dotdict({
     'checkpoint': './checkpoints',
 })
 
-# ── Resume flag ──────────────────────────────────────────────────────────────
-RESUME = False   # set to True to load best.pth.tar and continue training
+# ── CLI overrides (for Colab / command-line use) ─────────────────────────────
+_cli = argparse.ArgumentParser(add_help=True)
+_cli.add_argument('--checkpoint-dir',  default=None,
+                  help='Checkpoint directory (e.g. /content/drive/MyDrive/chess-bot)')
+_cli.add_argument('--resume',          action='store_true',
+                  help='Resume from best.pth.tar and saved examples')
+_cli.add_argument('--num-iters',       type=int, default=None)
+_cli.add_argument('--num-eps',         type=int, default=None)
+_cli.add_argument('--mcts-sims',       type=int, default=None)
+_cli.add_argument('--num-channels',    type=int, default=None)
+_cli.add_argument('--num-res-blocks',  type=int, default=None)
+_parsed = _cli.parse_args()
+
+if _parsed.checkpoint_dir:  args.checkpoint     = _parsed.checkpoint_dir
+if _parsed.num_iters:       args.numIters        = _parsed.num_iters
+if _parsed.num_eps:         args.numEps          = _parsed.num_eps
+if _parsed.mcts_sims:       args.numMCTSSims     = _parsed.mcts_sims
+if _parsed.num_channels:    args.num_channels    = _parsed.num_channels
+if _parsed.num_res_blocks:  args.num_res_blocks  = _parsed.num_res_blocks
+
+RESUME = _parsed.resume
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 
