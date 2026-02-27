@@ -48,11 +48,11 @@ def _run_episode_worker(checkpoint_dir: str, checkpoint_file: str, args_dict: di
 
     while True:
         step += 1
-        canonical = game.getCanonicalForm(board, cur_player)
+        # getCanonicalForm / getSymmetries omitted: both are chess no-ops.
+        # to_tensor(canonical=True) handles the player-perspective flip internally.
         temp = 1 if step <= args.tempThreshold else 0
-        pi   = mcts.getActionProb(canonical, temp=temp)
-        for sym_board, sym_pi in game.getSymmetries(canonical, pi):
-            examples.append([sym_board.to_tensor(canonical=True), sym_pi, cur_player])
+        pi   = mcts.getActionProb(board, temp=temp)
+        examples.append([board.to_tensor(canonical=True), pi, cur_player])
         action = np.random.choice(len(pi), p=pi)
         board, cur_player = game.getNextState(board, cur_player, action)
         r = game.getGameEnded(board, cur_player)
@@ -86,15 +86,12 @@ class Coach:
 
         while True:
             step += 1
-            canonical = self.game.getCanonicalForm(board, cur_player)
+            # getCanonicalForm / getSymmetries omitted: both are chess no-ops.
+            # to_tensor(canonical=True) handles the player-perspective flip internally.
             temp = 1 if step <= self.args.tempThreshold else 0
 
-            pi = mcts.getActionProb(canonical, temp=temp)
-            # Data augmentation via game symmetries
-            syms = self.game.getSymmetries(canonical, pi)
-            for sym_board, sym_pi in syms:
-                tensor = sym_board.to_tensor(canonical=True)
-                examples.append([tensor, sym_pi, cur_player])
+            pi = mcts.getActionProb(board, temp=temp)
+            examples.append([board.to_tensor(canonical=True), pi, cur_player])
 
             action = np.random.choice(len(pi), p=pi)
             board, cur_player = self.game.getNextState(board, cur_player, action)

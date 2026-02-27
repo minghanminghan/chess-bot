@@ -88,8 +88,11 @@ class ChessGame(Game):
         """
         Return board from current player's perspective.
         The canonical form is simply the board as-is; to_tensor(canonical=True)
-        handles the spatial flip. We return the board unchanged so that
-        python-chess can still be queried for legal moves.
+        handles the spatial flip internally by checking board.board.turn.
+
+        NOTE: not called from the self-play loop (Coach.executeEpisode /
+        _run_episode_worker) — those pass board directly. Still called by
+        MCTS.search() between moves as part of the abstract AlphaZero interface.
         """
         return board
 
@@ -97,8 +100,12 @@ class ChessGame(Game):
         self, board: ChessBoardState, pi: np.ndarray
     ) -> list[tuple[ChessBoardState, np.ndarray]]:
         """
-        Chess has no useful symmetries (unlike Othello).
-        Return the identity only.
+        Chess has no useful symmetries (unlike Othello or Go).
+        Returns the identity only — no augmentation is applied.
+
+        NOTE: not called from the self-play loop (Coach.executeEpisode /
+        _run_episode_worker) — the call was removed since it is a no-op.
+        Kept for compliance with the Game abstract interface.
         """
         return [(board, pi)]
 
