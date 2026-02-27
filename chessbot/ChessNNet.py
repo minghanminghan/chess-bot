@@ -104,6 +104,13 @@ class ChessNNet(NeuralNet):
             num_res_blocks=args.num_res_blocks,
         ).to(self.device)
 
+        if self.device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True
+            try:
+                self.nnet = torch.compile(self.nnet)
+            except Exception as e:
+                print(f"torch.compile unavailable ({e}); using eager mode")
+
     def train(self, examples):
         """
         examples: list of (board_np, pi, v)
@@ -117,6 +124,7 @@ class ChessNNet(NeuralNet):
             weight_decay=self.args.l2_reg,
         )
         self.nnet.train()
+        use_amp = self.device.type == 'cuda'
 
         for epoch in range(self.args.epochs):
             # Shuffle
@@ -136,13 +144,13 @@ class ChessNNet(NeuralNet):
                 pis = torch.tensor(np.array(pis), dtype=torch.float32, device=self.device)
                 vs  = torch.tensor(np.array(vs),  dtype=torch.float32, device=self.device)
 
-                log_ps, pred_vs = self.nnet(boards)
-                pred_vs = pred_vs.squeeze(1)
-
-                # Loss: cross-entropy for policy + MSE for value
-                pi_loss = -torch.mean(torch.sum(pis * log_ps, dim=1))
-                v_loss  = torch.mean((vs - pred_vs) ** 2)
-                loss    = pi_loss + v_loss
+                with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=use_amp):
+                    log_ps, pred_vs = self.nnet(boards)
+                    pred_vs = pred_vs.squeeze(1)
+                    # Loss: cross-entropy for policy + MSE for value
+                    pi_loss = -torch.mean(torch.sum(pis * log_ps, dim=1))
+                    v_loss  = torch.mean((vs - pred_vs) ** 2)
+                    loss    = pi_loss + v_loss
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -164,11 +172,13 @@ class ChessNNet(NeuralNet):
           v:  float
         """
         self.nnet.eval()
+        use_amp = self.device.type == 'cuda'
         with torch.no_grad():
             x = torch.tensor(board, dtype=torch.float32, device=self.device)
             x = x.permute(2, 0, 1).unsqueeze(0)   # (1, 119, 8, 8)
-            log_p, v = self.nnet(x)
-            pi = torch.exp(log_p).squeeze(0).cpu().numpy()
+            with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=use_amp):
+                log_p, v = self.nnet(x)
+            pi = torch.exp(log_p).squeeze(0).float().cpu().numpy()
             return pi, float(v.item())
 
     def save_checkpoint(self, folder: str = 'checkpoints', filename: str = 'checkpoint.pth.tar'):
@@ -178,5 +188,5 @@ class ChessNNet(NeuralNet):
 
     def load_checkpoint(self, folder: str = 'checkpoints', filename: str = 'checkpoint.pth.tar'):
         path = os.path.join(folder, filename)
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
         self.nnet.load_state_dict(checkpoint['state_dict'])

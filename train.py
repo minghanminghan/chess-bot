@@ -19,6 +19,7 @@ model update. Training examples are saved as checkpoint_<iter>.examples.
 import argparse
 import os
 import sys
+import torch
 sys.path.insert(0, os.path.dirname(__file__))
 
 from utils import dotdict
@@ -60,6 +61,9 @@ args = dotdict({
     'numItersForTrainExamplesHistory': 20,  # keep last 20 iters of examples
     'maxlenOfQueue': 200_000,               # (informational; enforced via history)
 
+    # ── Parallelism ───────────────────────────────────────────────────────────
+    'num_workers': 1,           # parallel self-play workers (1 = sequential)
+
     # ── Persistence ──────────────────────────────────────────────────────────
     'checkpoint': './checkpoints',
 })
@@ -75,6 +79,8 @@ _cli.add_argument('--num-eps',         type=int, default=None)
 _cli.add_argument('--mcts-sims',       type=int, default=None)
 _cli.add_argument('--num-channels',    type=int, default=None)
 _cli.add_argument('--num-res-blocks',  type=int, default=None)
+_cli.add_argument('--num-workers',     type=int, default=1,
+                  help='Parallel self-play workers (1 = sequential)')
 _parsed = _cli.parse_args()
 
 if _parsed.checkpoint_dir:  args.checkpoint     = _parsed.checkpoint_dir
@@ -83,18 +89,23 @@ if _parsed.num_eps:         args.numEps          = _parsed.num_eps
 if _parsed.mcts_sims:       args.numMCTSSims     = _parsed.mcts_sims
 if _parsed.num_channels:    args.num_channels    = _parsed.num_channels
 if _parsed.num_res_blocks:  args.num_res_blocks  = _parsed.num_res_blocks
+if _parsed.num_workers:     args.num_workers     = _parsed.num_workers
 
 RESUME = _parsed.resume
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 def main():
+    torch.set_float32_matmul_precision('high')   # enable TF32 for H100
+
     print("AlphaZero Chess — training run")
     print(f"  Iterations : {args.numIters}")
     print(f"  Episodes   : {args.numEps} per iteration  ({args.numIters * args.numEps:,} total)")
     print(f"  MCTS sims  : {args.numMCTSSims}")
     print(f"  Network    : {args.num_res_blocks} res-blocks × {args.num_channels} channels")
+    print(f"  Workers    : {args.num_workers}")
     print(f"  Checkpoint : {args.checkpoint}")
+    print(f"  Device     : {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
     print()
 
     game = ChessGame()

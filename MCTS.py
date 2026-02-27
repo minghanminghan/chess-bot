@@ -3,9 +3,9 @@ Monte Carlo Tree Search — AlphaZero style.
 
 Each node is identified by a string board representation.
 The tree stores:
-  Qsa[(s, a)]  Q-value of (state, action)
-  Nsa[(s, a)]  visit count of (state, action)
-  Ns[s]        visit count of state s
+  Qsa[s]   Q-values for all actions from s  (ndarray, shape action_size, f32)
+  Nsa[s]   visit counts for all actions     (ndarray, shape action_size, i32)
+  Ns[s]    visit count of state s
   Ps[s]        prior policy vector (from neural network)
   Es[s]        game-ended result (cached)
   Vs[s]        valid moves mask (cached)
@@ -31,8 +31,8 @@ class MCTS:
         self.nnet  = nnet
         self.args  = args
 
-        self.Qsa = {}   # (s, a) -> float
-        self.Nsa = {}   # (s, a) -> int
+        self.Qsa = {}   # s -> ndarray(action_size, f32)
+        self.Nsa = {}   # s -> ndarray(action_size, i32)
         self.Ns  = {}   # s -> int
         self.Ps  = {}   # s -> np.ndarray(action_size)
         self.Es  = {}   # s -> float (game-ended result, 0 = ongoing)
@@ -49,11 +49,8 @@ class MCTS:
         for _ in range(self.args.numMCTSSims):
             self.search(canonicalBoard)
 
-        s = self.game.stringRepresentation(canonicalBoard)
-        counts = np.array([
-            self.Nsa.get((s, a), 0)
-            for a in range(self.game.getActionSize())
-        ], dtype=np.float32)
+        s      = self.game.stringRepresentation(canonicalBoard)
+        counts = self.Nsa.get(s, np.zeros(self.game.getActionSize(), dtype=np.int32)).astype(np.float32)
 
         if temp == 0:
             best = np.argmax(counts)
@@ -112,38 +109,25 @@ class MCTS:
                 if sum_ps > EPS:
                     self.Ps[s] /= sum_ps
 
-            self.Ns[s] = 0
+            self.Ns[s]  = 0
+            self.Qsa[s] = np.zeros(self.game.getActionSize(), dtype=np.float32)
+            self.Nsa[s] = np.zeros(self.game.getActionSize(), dtype=np.int32)
             return -v
 
-        # ── Select action via UCB ───────────────────────────────────────────
-        valids = self.Vs[s]
-        best_u, best_a = -float('inf'), -1
+        # ── Select action via UCB (vectorised) ─────────────────────────────
+        valids  = self.Vs[s]
         sqrt_ns = math.sqrt(self.Ns[s] + EPS)
-
-        for a in range(self.game.getActionSize()):
-            if valids[a] == 0:
-                continue
-            q = self.Qsa.get((s, a), 0.0)
-            n = self.Nsa.get((s, a), 0)
-            u = q + self.args.cpuct * self.Ps[s][a] * sqrt_ns / (1 + n)
-            if u > best_u:
-                best_u = u
-                best_a = a
-
-        a = best_a
+        u       = self.Qsa[s] + self.args.cpuct * self.Ps[s] * sqrt_ns / (1 + self.Nsa[s])
+        u[valids == 0] = -np.inf
+        a = int(np.argmax(u))
         next_board, _ = self.game.getNextState(canonicalBoard, 1, a)
         next_canonical = self.game.getCanonicalForm(next_board, -1)
 
         v = self.search(next_canonical)
 
         # ── Back-propagate ──────────────────────────────────────────────────
-        if (s, a) in self.Qsa:
-            n = self.Nsa[(s, a)]
-            self.Qsa[(s, a)] = (self.Qsa[(s, a)] * n + v) / (n + 1)
-            self.Nsa[(s, a)] = n + 1
-        else:
-            self.Qsa[(s, a)] = v
-            self.Nsa[(s, a)] = 1
-
-        self.Ns[s] += 1
+        n = self.Nsa[s][a]
+        self.Qsa[s][a] = (self.Qsa[s][a] * n + v) / (n + 1)
+        self.Nsa[s][a] = n + 1
+        self.Ns[s]     += 1
         return -v

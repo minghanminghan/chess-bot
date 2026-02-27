@@ -17,10 +17,47 @@ import os
 import pickle
 import numpy as np
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
 from Arena import Arena
 from MCTS import MCTS
+
+
+# ── Module-level worker (must be top-level for multiprocessing pickling) ──────
+
+def _run_episode_worker(checkpoint_dir: str, checkpoint_file: str, args_dict: dict) -> list:
+    """Spawned by ProcessPoolExecutor. Loads its own model copy, runs one episode."""
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from chessbot.ChessGame import ChessGame
+    from chessbot.ChessNNet import ChessNNet
+    from MCTS import MCTS
+    from utils import dotdict
+
+    args  = dotdict(args_dict)
+    game  = ChessGame()
+    nnet  = ChessNNet(game, args)
+    nnet.load_checkpoint(checkpoint_dir, checkpoint_file)
+
+    mcts       = MCTS(game, nnet, args)
+    board      = game.getInitBoard()
+    cur_player = 1
+    step       = 0
+    examples   = []
+
+    while True:
+        step += 1
+        canonical = game.getCanonicalForm(board, cur_player)
+        temp = 1 if step <= args.tempThreshold else 0
+        pi   = mcts.getActionProb(canonical, temp=temp)
+        for sym_board, sym_pi in game.getSymmetries(canonical, pi):
+            examples.append([sym_board.to_tensor(canonical=True), sym_pi, cur_player])
+        action = np.random.choice(len(pi), p=pi)
+        board, cur_player = game.getNextState(board, cur_player, action)
+        r = game.getGameEnded(board, cur_player)
+        if r != 0:
+            return [(t, p, r * (1 if pl == cur_player else -1)) for t, p, pl in examples]
 
 
 class Coach:
@@ -82,9 +119,25 @@ class Coach:
 
             # ── Self-play ────────────────────────────────────────────────────
             if not self.skipFirstSelfPlay or i > 1:
+                os.makedirs(self.args.checkpoint, exist_ok=True)
+                WORKER_CKPT = 'worker.pth.tar'
+                self.nnet.save_checkpoint(self.args.checkpoint, WORKER_CKPT)
+
+                num_workers = self.args.get('num_workers', 1)
                 iteration_examples = []
-                for _ in tqdm(range(self.args.numEps), desc="Self-play"):
-                    iteration_examples += self.executeEpisode()
+
+                if num_workers > 1:
+                    with ProcessPoolExecutor(max_workers=num_workers) as pool:
+                        futures = [
+                            pool.submit(_run_episode_worker,
+                                        self.args.checkpoint, WORKER_CKPT, dict(self.args))
+                            for _ in range(self.args.numEps)
+                        ]
+                        for f in tqdm(as_completed(futures), total=self.args.numEps, desc="Self-play"):
+                            iteration_examples += f.result()
+                else:
+                    for _ in tqdm(range(self.args.numEps), desc="Self-play"):
+                        iteration_examples += self.executeEpisode()
 
                 self.trainExamplesHistory.append(iteration_examples)
 
