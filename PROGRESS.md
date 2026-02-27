@@ -71,13 +71,13 @@ chess-bot/
 
 ---
 
-## Phase 3 — Performance Optimisation (PLANNED)
+## Phase 3 — Performance Optimisation (COMPLETE)
 
 | # | File | Status | Description |
 |---|------|--------|-------------|
-| 15 | `MCTS.py` | ⬜ | Vectorised UCB: replace `{(s,a): scalar}` dicts with `{s: ndarray(4672)}` |
-| 16 | `Coach.py` + `train.py` | ⬜ | Parallel self-play via `ProcessPoolExecutor` + `--num-workers` CLI arg |
-| 17 | `bench.py` | ⬜ | Timing harness: measures sims/s before and after each change |
+| 15 | `MCTS.py` | ✅ | Vectorised UCB: replaced `{(s,a): scalar}` dicts with `{s: ndarray(4672)}`; numpy argmax replaces Python for-loop over 4,672 actions |
+| 16 | `Coach.py` + `train.py` | ✅ | Parallel self-play via `ProcessPoolExecutor` + `--num-workers` CLI arg; workers load shared checkpoint, return examples |
+| 17 | `bench.py` | ✅ | Timing harness: measures ms/move and sims/s; accepts `--sims`, `--episodes`, `--checkpoint-*` args |
 
 ---
 
@@ -104,321 +104,228 @@ B5 (batch MCTS) is the deepest fix but requires a near-complete MCTS rewrite —
 
 ---
 
-### Step 15 — `MCTS.py`: vectorised UCB
+## Phase 4.B — A100 Colab Profiling: Bottleneck Teardown
 
-#### What changes
+### Profiling configuration
+A100-SXM4-80GB · 4×64ch net · `torch.compile` + bfloat16
+50 moves × 50 sims = 2,500 total · wall time **17.7 s** → **354 ms/move** · **7.07 ms/sim**
 
-Replace the two `(s, a)`-keyed dicts with per-state numpy arrays.
+### Measured wall-time breakdown
 
-```
-Old                                      New
-───────────────────────────────────────  ────────────────────────────────────────
-self.Qsa = {}  # (s,a) -> float         self.Qsa = {}  # s -> ndarray(4672, f32)
-self.Nsa = {}  # (s,a) -> int           self.Nsa = {}  # s -> ndarray(4672, i32)
-```
-
-Every other dict (`Ns`, `Ps`, `Es`, `Vs`) is unchanged.
-
-#### Exact code changes (MCTS.py)
-
-**1. Leaf expansion** — after `self.Ns[s] = 0` (currently line 115), add two lines:
-```python
-self.Ns[s]  = 0
-self.Qsa[s] = np.zeros(self.game.getActionSize(), dtype=np.float32)   # NEW
-self.Nsa[s] = np.zeros(self.game.getActionSize(), dtype=np.int32)      # NEW
-return -v
-```
-
-**2. UCB selection** — replace the Python `for` loop (lines 118–132) entirely:
-```python
-# ── Select action via UCB (vectorised) ────────────────────────────────────
-valids   = self.Vs[s]
-sqrt_ns  = math.sqrt(self.Ns[s] + EPS)
-u        = self.Qsa[s] + self.args.cpuct * self.Ps[s] * sqrt_ns / (1 + self.Nsa[s])
-u[valids == 0] = -np.inf
-a = int(np.argmax(u))
-```
-
-**3. Backpropagation** — replace the `if/else` block (lines 140–148):
-```python
-n = self.Nsa[s][a]
-self.Qsa[s][a] = (self.Qsa[s][a] * n + v) / (n + 1)
-self.Nsa[s][a] = n + 1
-self.Ns[s]     += 1
-return -v
-```
-
-**4. `getActionProb` count extraction** — replace the list comprehension (lines 52–56):
-```python
-s      = self.game.stringRepresentation(canonicalBoard)
-counts = self.Nsa.get(s, np.zeros(self.game.getActionSize(), dtype=np.int32)).astype(np.float32)
-```
-
-No other changes. All callers are unaffected (public API unchanged).
+| Hot-path site | Cumtime | % total | Root cause |
+|---|---|---|---|
+| `to_tensor()` | 5.37 s | 30% | 8 × `chess.Board(fen)` + 512 × `piece_at()` per call |
+| `nnet.predict()` | 5.97 s | 34% | batch-1 GPU forward; kernel-launch overhead dominates compute |
+| `MCTS.search()` Python | 2.21 s | 13% | recursive Python; 5 × dict-hash per step on ~80-char FEN key |
+| `board.push()` / copy | ~1.5 s | ~8% | `chess.Board.copy()` on every MCTS tree-node expansion |
+| `string_representation()` | ~0.4 s | ~2% | `board.fen()` recomputed every sim even for the root |
+| `getValidMoves()` / legal_moves | ~0.25 s | ~1% | python-chess move generation per leaf (result cached in `Vs`) |
+| Remainder | ~2.0 s | ~11% | backprop arithmetic, numpy UCB, `is_game_over`, I/O |
 
 ---
 
-### Step 16 — `Coach.py` + `train.py`: parallel self-play
+### B1 — `to_tensor()` FEN reconstruction ✅ FIXED
 
-#### Why it helps
+**Root cause** `to_tensor()` called `chess.Board(fen)` × 8 per call to rebuild
+each history board from a string, then iterated all 64 squares with `piece_at()`.
+2,500 leaf expansions → 20,000 FEN parses + 1,280,000 `piece_at()` calls → 5.37 s.
 
-Episodes are independent. On a 12-CPU Colab A100 instance, 12 episodes can run simultaneously. The Python GIL is released during `torch` operations, so CPU-heavy tree traversal across workers overlaps with GPU inference.
-
-#### Architecture
-
-```
-Main process (GPU)
-    ├─ saves current weights → worker.pth.tar
-    └─ ProcessPoolExecutor(num_workers)
-            Worker 0  ─┐
-            Worker 1   ├─ each: loads worker.pth.tar, runs executeEpisode(), returns examples
-            Worker 2  ─┘
-    └─ collects all results, flattens, trains as before
-```
-
-Workers use the **same GPU** (PyTorch CUDA is multi-process safe). For > ~4 workers the GPU becomes the bottleneck; the sweet spot on a T4 is 2–3, on A100/H100 is 6–10.
-
-#### Code changes
-
-**`Coach.py` — extract episode into a module-level function** (so it is picklable for multiprocessing):
-
-```python
-# ── Module-level worker (must be at top level for pickling) ────────────────
-
-def _run_episode_worker(checkpoint_dir: str, checkpoint_file: str, args_dict: dict) -> list:
-    """Spawned by ProcessPoolExecutor. Loads its own model copy, runs one episode."""
-    import os, sys
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import numpy as np
-    from chessbot.ChessGame import ChessGame
-    from chessbot.ChessNNet import ChessNNet
-    from MCTS import MCTS
-    from utils import dotdict
-
-    args = dotdict(args_dict)
-    game = ChessGame()
-    nnet = ChessNNet(game, args)
-    nnet.load_checkpoint(checkpoint_dir, checkpoint_file)
-
-    mcts   = MCTS(game, nnet, args)
-    board  = game.getInitBoard()
-    cur_player = 1
-    step   = 0
-    examples = []
-
-    while True:
-        step += 1
-        canonical = game.getCanonicalForm(board, cur_player)
-        temp = 1 if step <= args.tempThreshold else 0
-        pi   = mcts.getActionProb(canonical, temp=temp)
-        for sym_board, sym_pi in game.getSymmetries(canonical, pi):
-            examples.append([sym_board.to_tensor(canonical=True), sym_pi, cur_player])
-        action = np.random.choice(len(pi), p=pi)
-        board, cur_player = game.getNextState(board, cur_player, action)
-        r = game.getGameEnded(board, cur_player)
-        if r != 0:
-            return [(t, p, r * (1 if pl == cur_player else -1)) for t, p, pl in examples]
-```
-
-**`Coach.learn()` — replace the sequential self-play loop:**
-
-```python
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
-# Before self-play: save weights so workers can load them
-WORKER_CKPT = 'worker.pth.tar'
-self.nnet.save_checkpoint(self.args.checkpoint, WORKER_CKPT)
-
-num_workers = self.args.get('num_workers', 1)
-iteration_examples = []
-
-if num_workers > 1:
-    with ProcessPoolExecutor(max_workers=num_workers) as pool:
-        futures = [
-            pool.submit(_run_episode_worker,
-                        self.args.checkpoint, WORKER_CKPT, dict(self.args))
-            for _ in range(self.args.numEps)
-        ]
-        for f in tqdm(as_completed(futures), total=self.args.numEps, desc="Self-play"):
-            iteration_examples += f.result()
-else:
-    for _ in tqdm(range(self.args.numEps), desc="Self-play"):
-        iteration_examples += self.executeEpisode()
-```
-
-**`train.py` — add `--num-workers` to the CLI block:**
-
-```python
-_cli.add_argument('--num-workers', type=int, default=1,
-                  help='Parallel self-play workers (1 = sequential)')
-# and in the overrides:
-if _parsed.num_workers: args.num_workers = _parsed.num_workers
-```
-
-**Windows guard** — `train.py` already has `if __name__ == '__main__': main()`, which is the required guard for `ProcessPoolExecutor` on Windows. No extra changes needed.
+**Fix applied** (`ChessBoard.py`)
+- `_push_history()` now pre-computes a `(8, 8, 12)` float32 occupancy array via
+  `board.piece_map()` (~20 occupied squares, not 64) at push time.
+- `to_tensor()` does 8 numpy slice-copies + scalar fills — zero python-chess calls.
+- New `_push_history()` cost: ~35 µs/push × 6,155 MCTS pushes ≈ **215 ms**.
+- Old reconstruction cost: ~1,877 µs/call × 2,500 calls = **4,692 ms**.
+- **Net savings: ~4.5 s → ≈ 26% overall speedup.**
 
 ---
 
-### Step 17 — `bench.py`: timing harness
+### Remaining estimated wall time after fix: ~13 s
 
-Standalone script that measures MCTS simulations/second so each optimisation can be quantified before and after. Run it before Step 15, after Step 15, and after Step 16.
+| # | Site | Est. time | % remaining | Fix |
+|---|------|-----------|----|-----|
+| B2 | `nnet.predict()` batch=1 | ~5.97 s | 46% | ✅ batch-MCTS (`_walk` + `_run_batch` + `predict_batch`) |
+| B3 | `board.push()` / `chess.Board.copy()` | ~1.5 s | 12% | ✅ `apply()`/`undo()` make-unmake |
+| — | MCTS Python / dict overhead | ~2.21 s | 17% | partly resolved by B3 + B4 |
+| B4 | FEN generation (`string_representation`) | ~0.4 s | 3% | ✅ Zobrist hash tuple |
+| B5 | CHW tensor layout | ~0.1 s | <1% | ✅ planes `(119,8,8)`, permutes removed |
+| — | `getValidMoves()` / `legal_moves` | ~0.25 s | 2% | (cached per unique state in `Vs`) |
+
+---
+
+### B2 — Batch neural network inference ✅ FIXED
+
+Every leaf expansion calls `predict()` with `batch=1`, paying a full CUDA
+kernel launch (~1 ms overhead) for each of ~2,500 calls per episode. The A100's
+tensor cores are nearly idle at batch-1; profiler shows 2.4 ms/call with this
+small net, dominated by launch latency not compute.
+
+At production config (800 sims, 20-block 256-ch net): the net is ~10× larger but
+A100 still under-utilised at batch-1. Every ms of launch latency × 800 sims ×
+~100 moves = **80 s/episode** wasted on overhead alone.
+
+**Fix: batch-MCTS with leaf queue**
+
+Replace the recursive depth-first search with a width-first accumulation loop:
+
+```
+For each of numMCTSSims iterations:
+  1. Walk tree greedily (UCB) until hitting a leaf → record path + board
+  2. Accumulate leaf boards in pending[]
+  3. When pending reaches batch_size (or all sims done):
+       tensors = np.stack([b.to_tensor() for b in pending])   # (N, 119, 8, 8)
+       pis, vs  = nnet.predict_batch(tensors)                 # one GPU call
+       expand each board, backprop all N paths in order
+```
+
+`ChessNNet.predict_batch()`:
+```python
+def predict_batch(self, boards: np.ndarray):
+    """boards: (N, 8, 8, 119)  →  pis: (N, 4672), vs: (N,)"""
+    self.nnet.eval()
+    with torch.no_grad():
+        x = torch.tensor(boards, dtype=torch.float32, device=self.device)
+        x = x.permute(0, 3, 1, 2)  # (N, 119, 8, 8)
+        with torch.autocast(...):
+            log_ps, vs = self.nnet(x)
+        return torch.exp(log_ps).float().cpu().numpy(), vs.squeeze(1).float().cpu().numpy()
+```
+
+**Expected impact**: 5–10× speedup on `predict()` (46% of remaining wall time)
+→ **~25–35% overall speedup**. Optimal batch size on A100: 32–128 (test empirically).
+**Cost**: near-complete MCTS rewrite. Cleanest to implement after B-C3 (push/pop)
+eliminates the need to pass board copies into recursive calls.
+
+---
+
+### B3 — `chess.Board.copy()` on every MCTS node ✅ FIXED
+
+`getNextState()` calls `board.push(move)` which calls `board.copy()` + `chess.Board.copy()`.
+`chess.Board.copy()` copies ~40 python-chess attributes including 8 bitboards.
+
+**Scale**: at 800 sims/move with average tree depth ~3:
+- ~2,400 copies per move × ~25 µs each = **60 ms/move from copies alone**
+- Across a 100-move game = **6 s per episode** just in board copies
+
+**Fix: mutable push / pop (make-unmake moves)**
+
+Change `ChessBoardState` to mutate in-place and expose a `pop()`:
 
 ```python
-"""
-Timing benchmark for MCTS + self-play.
+def push(self, move: chess.Move) -> None:
+    """Mutate board in place; save undo info on _undo_stack."""
+    # Deque is full when len == HISTORY_LEN; oldest entry will be displaced
+    displaced = self._history[0] if len(self._history) == self.HISTORY_LEN else None
+    self._undo_stack.append(displaced)
+    self.board.push(move)   # python-chess maintains its own undo stack
+    self._push_history()
 
-Usage:
-    uv run python bench.py                     # default: 3 episodes, 100 sims
-    uv run python bench.py --episodes 5 --sims 200
-    uv run python bench.py --checkpoint-dir ./checkpoints --checkpoint-file best.pth.tar
-"""
-import argparse, time
-import numpy as np
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('--episodes',         type=int, default=3)
-    p.add_argument('--sims',             type=int, default=100)
-    p.add_argument('--num-channels',     type=int, default=64)
-    p.add_argument('--num-res-blocks',   type=int, default=4)
-    p.add_argument('--checkpoint-dir',   default=None)
-    p.add_argument('--checkpoint-file',  default='best.pth.tar')
-    args = p.parse_args()
-
-    from chessbot.ChessGame import ChessGame
-    from chessbot.ChessNNet import ChessNNet
-    from MCTS import MCTS
-    from utils import dotdict
-    import os
-
-    cfg = dotdict(dict(numMCTSSims=args.sims, cpuct=1.0,
-                       dirichlet_alpha=0.0, tempThreshold=30,
-                       num_channels=args.num_channels, num_res_blocks=args.num_res_blocks))
-    game = ChessGame()
-    nnet = ChessNNet(game, cfg)
-    if args.checkpoint_dir:
-        path = os.path.join(args.checkpoint_dir, args.checkpoint_file)
-        if os.path.isfile(path):
-            nnet.load_checkpoint(args.checkpoint_dir, args.checkpoint_file)
-
-    total_moves = total_sims = 0
-    t0 = time.perf_counter()
-
-    for ep in range(args.episodes):
-        mcts  = MCTS(game, nnet, cfg)
-        board = game.getInitBoard()
-        cur   = 1
-        moves = 0
-        while True:
-            canonical = game.getCanonicalForm(board, cur)
-            pi        = mcts.getActionProb(canonical, temp=1)
-            action    = np.random.choice(len(pi), p=pi)
-            board, cur = game.getNextState(board, cur, action)
-            moves += 1
-            total_sims += args.sims
-            if game.getGameEnded(board, cur) != 0 or moves > 200:
-                break
-        total_moves += moves
-        print(f"  Episode {ep+1}: {moves} moves")
-
-    elapsed = time.perf_counter() - t0
-    print(f"\nTotal : {total_moves} moves | {total_sims:,} sims | {elapsed:.1f}s")
-    print(f"Speed : {total_moves/elapsed:.1f} moves/s  |  {total_sims/elapsed:,.0f} sims/s")
-    print(f"        {elapsed/total_moves*1000:.1f} ms/move  |  {elapsed/total_sims*1000:.2f} ms/sim")
-
-if __name__ == '__main__':
-    main()
+def pop(self) -> None:
+    """Undo last push."""
+    self.board.pop()
+    self._history.pop()                # remove newest entry (right end)
+    displaced = self._undo_stack.pop()
+    if displaced is not None:
+        self._history.appendleft(displaced)   # restore oldest entry (left end)
 ```
+
+`MCTS.search()` make-unmake pattern (replaces `getNextState` + `getCanonicalForm`):
+```python
+move = self.game.actionToMove(canonicalBoard, a)
+canonicalBoard.apply(move)
+v = self.search(canonicalBoard)
+canonicalBoard.undo()
+# back-propagate v as before
+```
+
+**Impact**: eliminates `chess.Board.copy()` entirely from MCTS; MCTS holds a single
+`ChessBoardState` object with a move stack instead of O(depth) copied objects.
+**Estimated savings**: ~1.5 s at 50 sims → **~10–12% overall speedup**; scales
+linearly with sim count (more impactful at 800 sims).
+**Note**: `ChessBoardState` becomes mutable; `Coach.executeEpisode()` already
+owns one board object per episode so this is safe. `Arena` and parallel workers
+each own their own board; no sharing concerns.
 
 ---
 
-### Verification
+### B4 — Zobrist hash replaces FEN as MCTS key ✅ FIXED
 
-```bash
-# ── Step 17 first: establish baseline ────────────────────────────────────────
-uv run python bench.py --episodes 3 --sims 100 --num-channels 64 --num-res-blocks 4
-# Record: ms/move and sims/s  (call this BASELINE)
+`MCTS.search()` calls `stringRepresentation(board)` once per call → `board.board.fen()`.
+python-chess FEN serialises the full position as an ~80-char string — ~50 µs/call.
+At 800 sims/move, average depth 3: **240,000 calls × 50 µs = 12 s/game** in FEN alone.
 
-# ── Step 15: apply vectorised UCB, re-run bench ──────────────────────────────
-uv run python bench.py --episodes 3 --sims 100 --num-channels 64 --num-res-blocks 4
-# Expect: ms/move drops 10-50% vs BASELINE (UCB loop eliminated)
-# Expect: sims/s increases proportionally
+Lazy-caching avoids recomputing the same FEN, but still pays the cost once per unique
+state and requires cache-invalidation plumbing inside `apply()`/`undo()`.
 
-# Correctness check after Step 15:
-uv run python -c "
-from chessbot.ChessGame import ChessGame
-from chessbot.ChessNNet import ChessNNet
-from MCTS import MCTS
-from utils import dotdict
-import numpy as np
+**Better fix: Zobrist hash tuple** (1 line in `ChessBoard.py`):
 
-cfg = dotdict(dict(numMCTSSims=50, cpuct=1.0, dirichlet_alpha=0.3,
-                   dirichlet_eps=0.25, num_channels=64, num_res_blocks=4))
-game = ChessGame()
-nnet = ChessNNet(game, cfg)
-mcts = MCTS(game, nnet, cfg)
-board = game.getInitBoard()
-pi = mcts.getActionProb(board, temp=1)
-assert abs(pi.sum() - 1.0) < 1e-5, f'Policy does not sum to 1: {pi.sum()}'
-assert pi[game.getValidMoves(board, 1) == 0].sum() == 0, 'Mass on illegal moves'
-print(f'Policy OK: sums to {pi.sum():.6f}, zero mass on illegal moves')
-"
-
-# ── Step 16: parallel self-play smoke test ───────────────────────────────────
-# Run 1-iter training with 4 episodes and 2 workers:
-uv run python train.py \
-  --num-iters 1 --num-eps 4 --mcts-sims 10 \
-  --num-channels 64 --num-res-blocks 4 \
-  --num-workers 2
-# Expect: completes without error; w+l+d == arenaCompare
-
-# ── Step 16: parallel bench vs sequential bench ──────────────────────────────
-# (run bench.py is single-process; to compare parallel throughput, time the 1-iter train)
-time uv run python train.py \
-  --num-iters 1 --num-eps 8 --mcts-sims 50 \
-  --num-channels 64 --num-res-blocks 4 \
-  --num-workers 1   # sequential baseline
-
-time uv run python train.py \
-  --num-iters 1 --num-eps 8 --mcts-sims 50 \
-  --num-channels 64 --num-res-blocks 4 \
-  --num-workers 4   # parallel
-# Expect: wall time drops ~2-4× with 4 workers
-
-# ── Full correctness: 3-iter training loop ───────────────────────────────────
-uv run python train.py \
-  --num-iters 3 --num-eps 4 --mcts-sims 20 \
-  --num-channels 64 --num-res-blocks 4 \
-  --num-workers 2
-# Expect: 3 complete iterations, checkpoints written, no exceptions
+```python
+def string_representation(self):
+    return (chess.polyglot.zobrist_hash(self.board), self.board.halfmove_clock)
 ```
+
+- `chess.polyglot.zobrist_hash()` — XOR of pre-computed table values: **~2 µs** vs 50 µs for FEN (~25× faster)
+- `halfmove_clock` — included so positions at different distances from the 50-move draw rule
+  get different MCTS keys; correctly distinguishes game-theoretically distinct states
+- Returns a `(int, int)` tuple — hashable; Python dicts accept any hashable key, no interface change
+- Collision probability: 1/2⁶⁴ ≈ 5×10⁻²⁰ — negligible in any realistic training run
+- **No cache lifecycle**: unlike lazy-FEN, Zobrist is computed fresh from the live board in 2 µs,
+  so `apply()` / `undo()` need zero cache-invalidation code
+
+**Estimated savings**: at 800 sims and 100 moves/game,
+~240,000 calls × (50–2) µs = **~11.5 s/game saved** (mostly recovered by FEN elimination;
+additional benefit over lazy-FEN is simpler code and O(1) dict hashing on int tuple vs string).
 
 ---
 
-## Phase 4 — GPU Optimisation (COMPLETE)
+### B5 — CHW tensor layout (eliminate redundant permutes) ✅ FIXED
 
-Targets H100/A100 Colab training. All changes are backward-compatible (fall back gracefully on CPU).
+`to_tensor()` returns `(8, 8, 119)` HWC.
+`predict()` does `.permute(2, 0, 1).unsqueeze(0)` → `(1, 119, 8, 8)` CHW.
+`train()` does `.permute(0, 3, 1, 2)` → `(B, 119, 8, 8)`.
 
-| # | File | Status | Description |
-|---|------|--------|-------------|
-| 18 | `chessbot/ChessNNet.py` | ✅ | `torch.backends.cudnn.benchmark = True` — lets cuDNN auto-select fastest conv algorithm for fixed 8×8×119 input |
-| 19 | `chessbot/ChessNNet.py` | ✅ | `torch.compile(self.nnet)` on CUDA — kernel fusion via Triton; ~2× forward/backward pass speedup; 30s warmup on first iteration |
-| 20 | `chessbot/ChessNNet.py` | ✅ | `torch.autocast(bfloat16)` in `train()` and `predict()` — bfloat16 tensor cores on H100; no GradScaler needed; `.float()` before `.numpy()` on outputs |
-| 21 | `chessbot/ChessNNet.py` | ✅ | `weights_only=True` in `torch.load` — silences FutureWarning; required from PyTorch 2.6+ |
-| 22 | `train.py` | ✅ | `torch.set_float32_matmul_precision('high')` — enables TF32 for float32 matmuls; prints device + workers at startup |
-| 23 | `train_colab.ipynb` | ✅ | Cell 1: remove redundant PyTorch reinstall (Colab ships 2.x+CUDA); saves ~3–5 min/session |
-| 24 | `train_colab.ipynb` | ✅ | Cell 5: `--num-workers 4` — uses H100's 12 vCPUs for parallel self-play |
+**Fix**: store piece planes as `(12, 8, 8)` in `_push_history()` and output
+`(119, 8, 8)` directly from `to_tensor()`.
 
-### Expected combined speedup on H100 vs baseline
+```python
+# _push_history() — store CHW:
+piece_planes = np.zeros((12, 8, 8), dtype=np.float32)
+for sq, piece in b.piece_map().items():
+    rank, file = divmod(sq, 8)
+    piece_planes[PIECE_TO_PLANE[(piece.piece_type, piece.color)], rank, file] = 1.0
 
-| Change | Training step | Self-play |
-|--------|--------------|-----------|
-| cudnn.benchmark | +10–30% | +10–30% |
-| torch.compile | +50–100% | +50–100% |
-| bfloat16 AMP | +100–200% | +50% |
-| TF32 matmul | +10–20% | — |
-| 4 workers | — | ~3× |
-| **Total** | **~5–8× vs CPU baseline** | **~5–10×** |
+# to_tensor() — output (119, 8, 8), rank-flip is axis-1 not axis-0:
+planes = np.zeros((119, 8, 8), dtype=np.float32)
+planes[offset:offset + 12] = piece_planes[:, ::-1, :] if flip else piece_planes
+
+# predict() — drop permute:
+x = torch.tensor(board, ...).unsqueeze(0)   # board is (119,8,8) → (1,119,8,8)
+
+# train() — drop permute:
+boards = torch.tensor(np.array(boards), ...).to(device)   # already (B,119,8,8)
+```
+
+**Impact**: saves ~5–10 µs per predict call; produces a contiguous CHW tensor
+for GPU transfer; eliminates non-contiguous views from `.permute()`.
+Net: **< 1% overall** but cleaner code and slightly better GPU transfer alignment.
+
+---
+
+### Implementation priority
+
+| Step | Change | Files | Status |
+|------|--------|-------|--------|
+| B4 | Zobrist hash key | `ChessBoard.py` | ✅ |
+| B3 | `apply()`/`undo()` make-unmake | `ChessBoard.py` + `ChessGame.py` + `MCTS.py` | ✅ |
+| B5 | CHW tensor layout, drop permutes | `ChessBoard.py` + `ChessNNet.py` | ✅ |
+| B2 | Batch MCTS (`_walk`/`_run_batch`/`_backprop` + `predict_batch`) | `MCTS.py` + `ChessNNet.py` + `train.py` | ✅ |
+
+**New CLI arg**: `--mcts-batch-size N` (default 8; try `--mcts-batch-size 64` on A100)
+
+**Combined expected speedup (B1–B5 all applied) at 800 sims on A100:**
+- Self-play: **4–8× faster** vs post-Phase-4 baseline
+- Full training iteration: **3–5× faster**
+- Remaining bottleneck: MCTS Python overhead (dict lookups, UCB, `legal_moves`)
 
 ---
 

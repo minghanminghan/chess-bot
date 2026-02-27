@@ -140,7 +140,7 @@ class ChessNNet(NeuralNet):
 
                 boards = torch.tensor(
                     np.array(boards), dtype=torch.float32, device=self.device
-                ).permute(0, 3, 1, 2)   # (B,8,8,119) → (B,119,8,8)
+                )   # already (B, 119, 8, 8) — CHW from to_tensor()
                 pis = torch.tensor(np.array(pis), dtype=torch.float32, device=self.device)
                 vs  = torch.tensor(np.array(vs),  dtype=torch.float32, device=self.device)
 
@@ -166,7 +166,7 @@ class ChessNNet(NeuralNet):
 
     def predict(self, board: np.ndarray):
         """
-        board: (8, 8, 119) float32 numpy array
+        board: (119, 8, 8) float32 numpy array  (CHW from to_tensor())
         Returns (pi, v):
           pi: (action_size,) numpy float32
           v:  float
@@ -174,12 +174,29 @@ class ChessNNet(NeuralNet):
         self.nnet.eval()
         use_amp = self.device.type == 'cuda'
         with torch.no_grad():
-            x = torch.tensor(board, dtype=torch.float32, device=self.device)
-            x = x.permute(2, 0, 1).unsqueeze(0)   # (1, 119, 8, 8)
+            x = torch.tensor(board, dtype=torch.float32, device=self.device).unsqueeze(0)  # (1, 119, 8, 8)
             with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=use_amp):
                 log_p, v = self.nnet(x)
             pi = torch.exp(log_p).squeeze(0).float().cpu().numpy()
             return pi, float(v.item())
+
+    def predict_batch(self, boards: np.ndarray):
+        """
+        boards: (N, 119, 8, 8) float32 — CHW stacked batch from to_tensor().
+        Returns:
+          pis: (N, action_size) float32
+          vs:  (N,)             float32
+        One GPU forward pass for the entire batch.
+        """
+        self.nnet.eval()
+        use_amp = self.device.type == 'cuda'
+        with torch.no_grad():
+            x = torch.tensor(boards, dtype=torch.float32, device=self.device)
+            with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=use_amp):
+                log_ps, vs = self.nnet(x)
+            pis = torch.exp(log_ps).float().cpu().numpy()
+            vs  = vs.squeeze(1).float().cpu().numpy()
+            return pis, vs
 
     def save_checkpoint(self, folder: str = 'checkpoints', filename: str = 'checkpoint.pth.tar'):
         os.makedirs(folder, exist_ok=True)

@@ -91,8 +91,8 @@ class ChessGame(Game):
         handles the spatial flip internally by checking board.board.turn.
 
         NOTE: not called from the self-play loop (Coach.executeEpisode /
-        _run_episode_worker) — those pass board directly. Still called by
-        MCTS.search() between moves as part of the abstract AlphaZero interface.
+        _run_episode_worker) — those pass board directly. Called by
+        Arena.playGame() which follows the canonical AlphaZero interface.
         """
         return board
 
@@ -109,8 +109,18 @@ class ChessGame(Game):
         """
         return [(board, pi)]
 
-    def stringRepresentation(self, board: ChessBoardState) -> str:
+    def stringRepresentation(self, board: ChessBoardState) -> tuple:
         return board.string_representation()
+
+    def actionToMove(self, board: ChessBoardState, action: int) -> "chess.Move":
+        """Convert a canonical action index to the chess.Move for the current board turn.
+        Used by MCTS make-unmake: avoids getNextState's board copy."""
+        move = action_to_move(action)
+        if move is None:
+            raise ValueError(f"Action {action} has no corresponding move.")
+        if board.board.turn == chess.BLACK:
+            move = _flip_move(move)
+        return move
 
 
 # ── Move flipping helpers ────────────────────────────────────────────────────

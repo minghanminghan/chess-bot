@@ -26,6 +26,7 @@ Action encoding: 64 × 73 = 4672 actions
 
 import numpy as np
 import chess
+import chess.polyglot
 from collections import deque
 
 # ── Coordinate convention ────────────────────────────────────────────────────
@@ -168,36 +169,63 @@ class ChessBoardState:
             board = chess.Board()
         self.board = board.copy()
         self._history: deque = deque(maxlen=self.HISTORY_LEN)
+        self._undo_stack: list = []   # for apply/undo (MCTS make-unmake)
         self._push_history()
 
     def _push_history(self):
         b = self.board
         rep1 = int(b.is_repetition(2))
         rep2 = int(b.is_repetition(3))
-        self._history.append((b.board_fen(), rep1, rep2))
+        # Pre-compute piece-occupancy planes in CHW layout (12, 8, 8).
+        # piece_planes[plane, rank, file] = 1.0 for occupied squares.
+        piece_planes = np.zeros((12, 8, 8), dtype=np.float32)
+        for sq, piece in b.piece_map().items():
+            plane_idx = PIECE_TO_PLANE[(piece.piece_type, piece.color)]
+            rank, file = divmod(sq, 8)
+            piece_planes[plane_idx, rank, file] = 1.0
+        self._history.append((piece_planes, rep1, rep2))
 
     def copy(self) -> "ChessBoardState":
         new = ChessBoardState.__new__(ChessBoardState)
         new.board = self.board.copy()
         new._history = deque(list(self._history), maxlen=self.HISTORY_LEN)
+        new._undo_stack = []   # fresh stack; caller owns this copy
         return new
 
     def push(self, move: chess.Move) -> "ChessBoardState":
-        """Return new state after applying move (non-destructive)."""
+        """Return a new state after applying move (non-destructive; used by Coach/Arena)."""
         new = self.copy()
         new.board.push(move)
         new._push_history()
         return new
 
+    # ── Make / unmake for MCTS (no copy; ~25× cheaper than push()) ───────────
+
+    def apply(self, move: chess.Move) -> None:
+        """Mutate board in place; record undo info so undo() can restore exactly."""
+        # When deque is full the leftmost (oldest) entry is auto-displaced on append.
+        displaced = self._history[0] if len(self._history) == self.HISTORY_LEN else None
+        self._undo_stack.append(displaced)
+        self.board.push(move)      # python-chess tracks its own undo stack
+        self._push_history()
+
+    def undo(self) -> None:
+        """Undo the last apply(); restores board to the state before that call."""
+        self.board.pop()           # restores pieces, rights, clocks
+        self._history.pop()        # remove newest entry (right / newest end)
+        displaced = self._undo_stack.pop()
+        if displaced is not None:
+            self._history.appendleft(displaced)   # restore oldest entry
+
     # ── Feature tensor ───────────────────────────────────────────────────────
 
     def to_tensor(self, canonical: bool = True) -> np.ndarray:
         """
-        Return (8, 8, 119) float32 array.
+        Return (119, 8, 8) float32 CHW array.
         canonical=True: board is oriented from current player's perspective
         (black's pieces appear at the bottom when it is black's turn).
         """
-        planes = np.zeros((8, 8, 119), dtype=np.float32)
+        planes = np.zeros((119, 8, 8), dtype=np.float32)
         history = list(self._history)   # oldest → newest
 
         # Pad to HISTORY_LEN with None entries at the front
@@ -210,31 +238,23 @@ class ChessBoardState:
             offset = t * 14
             if entry is None:
                 continue
-            fen, rep1, rep2 = entry
-            tmp = chess.Board(fen)
-
-            for sq in chess.SQUARES:
-                piece = tmp.piece_at(sq)
-                if piece is None:
-                    continue
-                plane_idx = PIECE_TO_PLANE[(piece.piece_type, piece.color)]
-                rank, file = divmod(sq, 8)
-                row = (7 - rank) if flip else rank
-                planes[row, file, offset + plane_idx] = 1.0
-
+            piece_planes, rep1, rep2 = entry
+            # CHW: piece_planes shape (12, 8, 8).
+            # Vertical flip for black: reverse rank axis (axis 1 in CHW).
+            planes[offset:offset + 12] = piece_planes[:, ::-1, :] if flip else piece_planes
             if rep1:
-                planes[:, :, offset + 12] = 1.0
+                planes[offset + 12] = 1.0   # broadcasts scalar to (8, 8)
             if rep2:
-                planes[:, :, offset + 13] = 1.0
+                planes[offset + 13] = 1.0
 
-        # Scalar planes 112–118
-        planes[:, :, 112] = float(self.board.turn == chess.WHITE)
-        planes[:, :, 113] = self.board.fullmove_number / 500.0
-        planes[:, :, 114] = float(self.board.has_kingside_castling_rights(chess.WHITE))
-        planes[:, :, 115] = float(self.board.has_queenside_castling_rights(chess.WHITE))
-        planes[:, :, 116] = float(self.board.has_kingside_castling_rights(chess.BLACK))
-        planes[:, :, 117] = float(self.board.has_queenside_castling_rights(chess.BLACK))
-        planes[:, :, 118] = self.board.halfmove_clock / 100.0
+        # Scalar planes 112–118 (scalar broadcast to each 8×8 slice)
+        planes[112] = float(self.board.turn == chess.WHITE)
+        planes[113] = self.board.fullmove_number / 500.0
+        planes[114] = float(self.board.has_kingside_castling_rights(chess.WHITE))
+        planes[115] = float(self.board.has_queenside_castling_rights(chess.WHITE))
+        planes[116] = float(self.board.has_kingside_castling_rights(chess.BLACK))
+        planes[117] = float(self.board.has_queenside_castling_rights(chess.BLACK))
+        planes[118] = self.board.halfmove_clock / 100.0
 
         return planes
 
@@ -264,5 +284,8 @@ class ChessBoardState:
         else:
             return 1e-4
 
-    def string_representation(self) -> str:
-        return self.board.fen()
+    def string_representation(self) -> tuple:
+        """Zobrist hash + halfmove clock — fast hashable key for MCTS dicts.
+        ~2 µs vs ~50 µs for board.fen(). Includes halfmove_clock so positions
+        at different distances from the 50-move draw rule get distinct keys."""
+        return (chess.polyglot.zobrist_hash(self.board), self.board.halfmove_clock)

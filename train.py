@@ -62,7 +62,8 @@ args = dotdict({
     'maxlenOfQueue': 200_000,               # (informational; enforced via history)
 
     # ── Parallelism ───────────────────────────────────────────────────────────
-    'num_workers': 1,           # parallel self-play workers (1 = sequential)
+    'num_workers':    1,        # parallel self-play workers (1 = sequential)
+    'mcts_batch_size': 8,       # leaves per GPU call inside MCTS (B2 opt)
 
     # ── Persistence ──────────────────────────────────────────────────────────
     'checkpoint': './checkpoints',
@@ -79,8 +80,10 @@ _cli.add_argument('--num-eps',         type=int, default=None)
 _cli.add_argument('--mcts-sims',       type=int, default=None)
 _cli.add_argument('--num-channels',    type=int, default=None)
 _cli.add_argument('--num-res-blocks',  type=int, default=None)
-_cli.add_argument('--num-workers',     type=int, default=1,
+_cli.add_argument('--num-workers',      type=int, default=1,
                   help='Parallel self-play workers (1 = sequential)')
+_cli.add_argument('--mcts-batch-size', type=int, default=None,
+                  help='Leaves per GPU call in MCTS (default 8; try 32–128 on A100)')
 _parsed = _cli.parse_args()
 
 if _parsed.checkpoint_dir:  args.checkpoint     = _parsed.checkpoint_dir
@@ -89,7 +92,8 @@ if _parsed.num_eps:         args.numEps          = _parsed.num_eps
 if _parsed.mcts_sims:       args.numMCTSSims     = _parsed.mcts_sims
 if _parsed.num_channels:    args.num_channels    = _parsed.num_channels
 if _parsed.num_res_blocks:  args.num_res_blocks  = _parsed.num_res_blocks
-if _parsed.num_workers:     args.num_workers     = _parsed.num_workers
+if _parsed.num_workers:       args.num_workers      = _parsed.num_workers
+if _parsed.mcts_batch_size:   args.mcts_batch_size  = _parsed.mcts_batch_size
 
 RESUME = _parsed.resume
 
@@ -104,6 +108,7 @@ def main():
     print(f"  MCTS sims  : {args.numMCTSSims}")
     print(f"  Network    : {args.num_res_blocks} res-blocks × {args.num_channels} channels")
     print(f"  Workers    : {args.num_workers}")
+    print(f"  MCTS batch : {args.mcts_batch_size}")
     print(f"  Checkpoint : {args.checkpoint}")
     print(f"  Device     : {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
     print()
