@@ -170,19 +170,31 @@ class ChessBoardState:
         self.board = board.copy()
         self._history: deque = deque(maxlen=self.HISTORY_LEN)
         self._undo_stack: list = []   # for apply/undo (MCTS make-unmake)
+        self._zobrist_hash: int = 0   # set immediately by _push_history()
         self._push_history()
 
     def _push_history(self):
         b = self.board
         rep1 = int(b.is_repetition(2))
         rep2 = int(b.is_repetition(3))
-        # Pre-compute piece-occupancy planes in CHW layout (12, 8, 8).
-        # piece_planes[plane, rank, file] = 1.0 for occupied squares.
+
+        # C1: cache Zobrist hash so string_representation() is O(1).
+        self._zobrist_hash = chess.polyglot.zobrist_hash(b)
+
+        # C2: build piece-occupancy planes from bitboards instead of piece_map().
+        # board.pieces_mask(pt, color) returns a 64-bit int; bit rank*8+file = 1
+        # if that piece type is on that square.
+        # int.to_bytes(8,'little') → np.frombuffer → np.unpackbits(bitorder='little')
+        # → reshape(8,8) maps bit positions directly to (rank, file) indices.
         piece_planes = np.zeros((12, 8, 8), dtype=np.float32)
-        for sq, piece in b.piece_map().items():
-            plane_idx = PIECE_TO_PLANE[(piece.piece_type, piece.color)]
-            rank, file = divmod(sq, 8)
-            piece_planes[plane_idx, rank, file] = 1.0
+        for (pt, color), plane_idx in PIECE_TO_PLANE.items():
+            bb = b.pieces_mask(pt, color)
+            if bb:
+                piece_planes[plane_idx] = np.unpackbits(
+                    np.frombuffer(bb.to_bytes(8, 'little'), dtype=np.uint8),
+                    bitorder='little',
+                ).reshape(8, 8)
+
         self._history.append((piece_planes, rep1, rep2))
 
     def copy(self) -> "ChessBoardState":
@@ -190,6 +202,7 @@ class ChessBoardState:
         new.board = self.board.copy()
         new._history = deque(list(self._history), maxlen=self.HISTORY_LEN)
         new._undo_stack = []   # fresh stack; caller owns this copy
+        new._zobrist_hash = self._zobrist_hash   # C1: carry hash to copy
         return new
 
     def push(self, move: chess.Move) -> "ChessBoardState":
@@ -205,15 +218,16 @@ class ChessBoardState:
         """Mutate board in place; record undo info so undo() can restore exactly."""
         # When deque is full the leftmost (oldest) entry is auto-displaced on append.
         displaced = self._history[0] if len(self._history) == self.HISTORY_LEN else None
-        self._undo_stack.append(displaced)
+        # C1: save current hash so undo() can restore it without recomputing.
+        self._undo_stack.append((displaced, self._zobrist_hash))
         self.board.push(move)      # python-chess tracks its own undo stack
-        self._push_history()
+        self._push_history()       # updates self._zobrist_hash
 
     def undo(self) -> None:
         """Undo the last apply(); restores board to the state before that call."""
         self.board.pop()           # restores pieces, rights, clocks
         self._history.pop()        # remove newest entry (right / newest end)
-        displaced = self._undo_stack.pop()
+        displaced, self._zobrist_hash = self._undo_stack.pop()   # C1: restore hash
         if displaced is not None:
             self._history.appendleft(displaced)   # restore oldest entry
 
@@ -286,6 +300,5 @@ class ChessBoardState:
 
     def string_representation(self) -> tuple:
         """Zobrist hash + halfmove clock — fast hashable key for MCTS dicts.
-        ~2 µs vs ~50 µs for board.fen(). Includes halfmove_clock so positions
-        at different distances from the 50-move draw rule get distinct keys."""
-        return (chess.polyglot.zobrist_hash(self.board), self.board.halfmove_clock)
+        Hash is cached in _zobrist_hash by _push_history() so this is O(1)."""
+        return (self._zobrist_hash, self.board.halfmove_clock)
