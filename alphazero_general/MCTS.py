@@ -58,10 +58,11 @@ class MCTS:
         """
         batch_size = self.args.get('mcts_batch_size', 8)
         sims_left  = self.args.numMCTSSims
+        root_s     = self.game.stringRepresentation(canonicalBoard)
 
         while sims_left > 0:
             n = min(batch_size, sims_left)
-            self._run_batch(canonicalBoard, n)
+            self._run_batch(canonicalBoard, n, root_s)
             sims_left -= n
 
         s      = self.game.stringRepresentation(canonicalBoard)
@@ -86,7 +87,7 @@ class MCTS:
 
     # ── Batch machinery ──────────────────────────────────────────────────────
 
-    def _run_batch(self, root_board, n: int) -> None:
+    def _run_batch(self, root_board, n: int, root_s=None) -> None:
         """
         Walk n simulations to leaves, expand all with one GPU call, backprop.
 
@@ -130,8 +131,8 @@ class MCTS:
             sum_ps = pi.sum()
             pi     = pi / sum_ps if sum_ps > EPS else valids / (valids.sum() + EPS)
 
-            # Dirichlet noise — preserves existing per-leaf behaviour.
-            if self.args.get('dirichlet_alpha', 0) > 0:
+            # Dirichlet noise at root only (AlphaZero paper §B).
+            if s == root_s and self.args.get('dirichlet_alpha', 0) > 0:
                 noise = np.random.dirichlet([self.args.dirichlet_alpha] * action_size)
                 eps   = self.args.get('dirichlet_eps', 0.25)
                 pi    = (1 - eps) * pi + eps * noise * valids

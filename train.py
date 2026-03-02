@@ -44,26 +44,31 @@ args = dotdict({
     'tempThreshold': 30,    # moves before switching τ → 0
 
     # ── Training ─────────────────────────────────────────────────────────────
-    'lr':           0.001,  # Adam learning rate
+    'lr':           0.01,   # initial learning rate (first lr_schedule tier)
     'l2_reg':       1e-4,   # L2 weight regularisation (c in the paper)
     'epochs':       10,     # gradient epochs per training call
-    'batch_size':   512,    # mini-batch size
+    'batch_size':   1024,   # mini-batch size
+
+    # ── LR schedule — iteration → lr (applied at start of that iteration) ──
+    # Mirrors AlphaZero paper: high lr early, decay as training matures.
+    # Keys are iteration numbers (1-based); the highest key ≤ current iter wins.
+    'lr_schedule':  {1: 0.01, 300: 0.001, 700: 0.0001},
 
     # ── Network architecture ─────────────────────────────────────────────────
     'num_channels':   256,  # ResNet filter count (AlphaZero: 256)
     'num_res_blocks':  20,  # residual tower depth (AlphaZero: 20)
 
     # ── Arena / model acceptance ─────────────────────────────────────────────
-    'arenaCompare':      40,    # games per evaluation round
+    'arenaCompare':      100,   # games per evaluation round
     'updateThreshold':   0.55,  # min win-rate to accept new model
 
     # ── Example history ──────────────────────────────────────────────────────
-    'numItersForTrainExamplesHistory': 20,  # keep last 20 iters of examples
+    'numItersForTrainExamplesHistory': 30,  # keep last 30 iters of examples
     'maxlenOfQueue': 200_000,               # (informational; enforced via history)
 
     # ── Parallelism ───────────────────────────────────────────────────────────
     'num_workers':    1,        # parallel self-play workers (1 = sequential)
-    'mcts_batch_size': 8,       # leaves per GPU call inside MCTS (B2 opt)
+    'mcts_batch_size': 64,      # leaves per GPU call inside MCTS
 
     # ── Persistence ──────────────────────────────────────────────────────────
     'checkpoint': './checkpoints',

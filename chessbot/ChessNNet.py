@@ -113,16 +113,19 @@ class ChessNNet(NeuralNet):
                 except Exception as e:
                     print(f"torch.compile unavailable ({e}); using eager mode")
 
-    def train(self, examples):
+    def train(self, examples, lr: float | None = None):
         """
         examples: list of (board_np, pi, v)
-          board_np: (8, 8, 119) float32
+          board_np: (119, 8, 8) float32
           pi:       (action_size,) float32
           v:        float
+        lr: learning rate override (from Coach lr_schedule); falls back to args.lr.
         """
+        current_lr = lr if lr is not None else self.args.lr
+        print(f"  lr={current_lr:.2e}  examples={len(examples)}")
         optimizer = optim.Adam(
             self.nnet.parameters(),
-            lr=self.args.lr,
+            lr=current_lr,
             weight_decay=self.args.l2_reg,
         )
         self.nnet.train()
@@ -154,7 +157,7 @@ class ChessNNet(NeuralNet):
                     v_loss  = torch.mean((vs - pred_vs) ** 2)
                     loss    = pi_loss + v_loss
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
 
@@ -175,8 +178,8 @@ class ChessNNet(NeuralNet):
         """
         self.nnet.eval()
         use_amp = self.device.type == 'cuda'
-        with torch.no_grad():
-            x = torch.tensor(board, dtype=torch.float32, device=self.device).unsqueeze(0)  # (1, 119, 8, 8)
+        with torch.inference_mode():
+            x = torch.from_numpy(board).unsqueeze(0).to(self.device, non_blocking=True)
             with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=use_amp):
                 log_p, v = self.nnet(x)
             pi = torch.exp(log_p).squeeze(0).float().cpu().numpy()
@@ -192,8 +195,8 @@ class ChessNNet(NeuralNet):
         """
         self.nnet.eval()
         use_amp = self.device.type == 'cuda'
-        with torch.no_grad():
-            x = torch.tensor(boards, dtype=torch.float32, device=self.device)
+        with torch.inference_mode():
+            x = torch.from_numpy(boards).to(self.device, non_blocking=True)
             with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=use_amp):
                 log_ps, vs = self.nnet(x)
             pis = torch.exp(log_ps).float().cpu().numpy()

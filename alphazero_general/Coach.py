@@ -106,6 +106,23 @@ class Coach:
                     for tensor, pi_ex, player in examples
                 ]
 
+    # ── LR schedule ──────────────────────────────────────────────────────────
+
+    def _get_lr(self, iteration: int) -> float:
+        """
+        Return the learning rate for the given iteration.
+        args.lr_schedule is a dict {start_iter: lr}; the entry with the
+        highest key that is <= iteration wins.  Falls back to args.lr.
+        """
+        schedule = self.args.get('lr_schedule', {})
+        if not schedule:
+            return self.args.lr
+        lr = self.args.lr
+        for milestone, rate in sorted(schedule.items()):
+            if iteration >= milestone:
+                lr = rate
+        return lr
+
     # ── Training loop ────────────────────────────────────────────────────────
 
     def learn(self):
@@ -155,7 +172,7 @@ class Coach:
 
             pmcts = MCTS(self.game, self.pnet, self.args)
 
-            self.nnet.train(train_examples)
+            self.nnet.train(train_examples, lr=self._get_lr(i))
             nmcts = MCTS(self.game, self.nnet, self.args)
 
             # ── Arena ────────────────────────────────────────────────────────
