@@ -18,7 +18,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 
-from NeuralNet import NeuralNet
+from alphazero_general.NeuralNet import NeuralNet
 from chessbot.ChessBoard import ACTION_SIZE
 
 
@@ -106,10 +106,12 @@ class ChessNNet(NeuralNet):
 
         if self.device.type == 'cuda':
             torch.backends.cudnn.benchmark = True
-            try:
-                self.nnet = torch.compile(self.nnet)
-            except Exception as e:
-                print(f"torch.compile unavailable ({e}); using eager mode")
+            import sys
+            if sys.platform != 'win32':
+                try:
+                    self.nnet = torch.compile(self.nnet)
+                except Exception as e:
+                    print(f"torch.compile unavailable ({e}); using eager mode")
 
     def train(self, examples):
         """

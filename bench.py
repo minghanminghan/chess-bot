@@ -24,7 +24,7 @@ def main():
 
     from chessbot.ChessGame import ChessGame
     from chessbot.ChessNNet import ChessNNet
-    from MCTS import MCTS
+    from alphazero_general.MCTS import MCTS
     from utils import dotdict
 
     cfg = dotdict(dict(numMCTSSims=args.sims, cpuct=1.0,

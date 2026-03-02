@@ -1,3 +1,7 @@
 .vscode
 __pycache__
 .claude
+
+# reproducible
+checkpoints/
+build_cboard/

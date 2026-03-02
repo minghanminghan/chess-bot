@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from utils import dotdict
 from chessbot.ChessGame import ChessGame
 from chessbot.ChessNNet import ChessNNet
-from Coach import Coach
+from alphazero_general.Coach import Coach
 
 # ── Hyperparameters ──────────────────────────────────────────────────────────
 

@@ -27,10 +27,11 @@ from textual.containers import Horizontal
 from textual.widgets import Header, Footer, Static, Input, Button
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from chessbot.ChessBoard import ChessBoardState, move_to_action, action_to_move
-from chessbot.ChessGame import ChessGame, _flip_move
+from chessbot.ChessBoard import ChessBoardState
+from chessbot.ChessGame import ChessGame
 from chessbot.ChessNNet import ChessNNet
-from MCTS import MCTS
+from chessbot.ui_utils import action_to_uci, uci_to_action
+from alphazero_general.MCTS import MCTS
 from utils import dotdict
 
 
@@ -242,6 +243,7 @@ class PlayApp(App):
         self._human_is_white = human_is_white
         self._pgn_dir = pgn_dir
         self._board_state = game.getInitBoard()
+        self._chess_board = chess.Board()   # parallel board for display / SAN / legal moves
         self._cur_player = 1
         self._moves_played: list[chess.Move] = []
         self._game_over = False
@@ -251,7 +253,7 @@ class PlayApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         with Horizontal(id="main"):
-            yield BoardWidget(self._board_state.board, flip=self._flip, id="board_widget")
+            yield BoardWidget(self._chess_board, flip=self._flip, id="board_widget")
             yield Static("", id="info")
         with Horizontal(id="input_row"):
             yield Input(placeholder="UCI move (e.g. e2e4)", id="move_input")
@@ -286,19 +288,19 @@ class PlayApp(App):
 
     def _run_mcts_sync(self) -> "chess.Move | None":
         """Blocking — runs in thread pool. Returns the real-coordinate move."""
+        is_black = self._board_state.side_to_move() == -1
         canonical = self._game.getCanonicalForm(self._board_state, self._cur_player)
         mcts = MCTS(self._game, self._nnet, self._mcts_args)
         probs = mcts.getActionProb(canonical, temp=0)
         action = int(np.argmax(probs))
-        raw_move = action_to_move(action)
-        if raw_move is None:
-            return None
-        was_black = self._board_state.board.turn == chess.BLACK
-        real_move = _flip_move(raw_move) if was_black else raw_move
+        uci = action_to_uci(action, is_black=is_black)
+        move = chess.Move.from_uci(uci) if uci else None
         self._board_state, self._cur_player = self._game.getNextState(
             self._board_state, self._cur_player, action
         )
-        return real_move
+        if move:
+            self._chess_board.push(move)
+        return move
 
     # ── Human move ────────────────────────────────────────────────────────────
 
@@ -316,19 +318,17 @@ class PlayApp(App):
             self._update_display()
             return
 
-        board = self._board_state.board
-        if move not in board.legal_moves:
+        if move not in self._chess_board.legal_moves:
             promo = chess.Move.from_uci(uci_str + "q")
-            if promo in board.legal_moves:
+            if promo in self._chess_board.legal_moves:
                 move = promo
             else:
                 self._status = f"Illegal move: {uci_str}"
                 self._update_display()
                 return
 
-        was_black = board.turn == chess.BLACK
-        canonical_move = _flip_move(move) if was_black else move
-        action = move_to_action(canonical_move)
+        is_black = self._board_state.side_to_move() == -1
+        action = uci_to_action(move.uci(), is_black=is_black)
         if action is None:
             self._status = f"Move not in action table: {uci_str}"
             self._update_display()
@@ -337,6 +337,7 @@ class PlayApp(App):
         self._board_state, self._cur_player = self._game.getNextState(
             self._board_state, self._cur_player, action
         )
+        self._chess_board.push(move)
         self._moves_played.append(move)
         self._check_game_over()
         if not self._game_over:
@@ -346,11 +347,10 @@ class PlayApp(App):
     # ── Game end ──────────────────────────────────────────────────────────────
 
     def _check_game_over(self) -> None:
-        board = self._board_state.board
-        if not board.is_game_over():
+        if not self._chess_board.is_game_over():
             return
         self._game_over = True
-        result = board.result()
+        result = self._chess_board.result()
         label = {"1-0": "White wins", "0-1": "Black wins"}.get(result, "Draw")
         self._status = f"Game over: {label} ({result})"
         pgn_path = self._save_pgn(result)
@@ -401,13 +401,12 @@ class PlayApp(App):
         self.query_one("#btn_submit", Button).disabled = not enabled
 
     def _update_display(self) -> None:
-        board = self._board_state.board
-        last = board.move_stack[-1] if board.move_stack else None
-        self.query_one(BoardWidget).set_board(board, last)
+        last = self._chess_board.move_stack[-1] if self._chess_board.move_stack else None
+        self.query_one(BoardWidget).set_board(self._chess_board, last)
         self.query_one("#info", Static).update(self._make_info())
 
     def _make_info(self) -> Text:
-        board = self._board_state.board
+        board = self._chess_board
         t = Text()
         t.append("You:    ", style="bold")
         t.append(f"{'White' if self._human_is_white else 'Black'}\n")
@@ -418,7 +417,7 @@ class PlayApp(App):
         t.append("Status: ", style="bold")
         t.append(f"{self._status}\n\n")
 
-        is_human_turn = (board.turn == chess.WHITE) == self._human_is_white
+        is_human_turn = (board.turn == chess.WHITE) == self._human_is_white  # board = self._chess_board
         if is_human_turn and not self._game_over:
             legal = list(board.legal_moves)
             ucis = [m.uci() for m in legal[:8]]

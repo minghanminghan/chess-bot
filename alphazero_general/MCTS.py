@@ -187,7 +187,7 @@ class MCTS:
             a = int(np.argmax(u))
 
             path.append((s, a))
-            board.apply(self.game.actionToMove(board, a))
+            board.apply(a)
 
     def _backprop(self, path, leaf_v: float) -> None:
         """

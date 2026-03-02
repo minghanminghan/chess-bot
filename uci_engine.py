@@ -21,14 +21,14 @@ import argparse
 import os
 import sys
 
-import chess
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from chessbot.ChessBoard import ChessBoardState, action_to_move
-from chessbot.ChessGame import ChessGame, _flip_move
+from chessbot.ChessBoard import ChessBoardState
+from chessbot.ChessGame import ChessGame
 from chessbot.ChessNNet import ChessNNet
-from MCTS import MCTS
+from chessbot.ui_utils import action_to_uci
+from alphazero_general.MCTS import MCTS
 from utils import dotdict
 
 
@@ -65,7 +65,6 @@ def main() -> None:
 
     # Mutable game state — reset on each 'position' command
     board_state = ChessBoardState()
-    cur_player = 1  # 1=white, -1=black
 
     # ── Handlers ─────────────────────────────────────────────────────────────
 
@@ -75,46 +74,45 @@ def main() -> None:
         print("uciok", flush=True)
 
     def handle_position(line: str) -> None:
-        nonlocal board_state, cur_player
+        nonlocal board_state
         tokens = line.split()
-        board = chess.Board()
         i = 1
+        new_state = ChessBoardState()  # default: startpos
         if i < len(tokens) and tokens[i] == "fen":
             fen_parts = []
             i += 1
             while i < len(tokens) and tokens[i] != "moves":
                 fen_parts.append(tokens[i])
                 i += 1
-            board.set_fen(" ".join(fen_parts))
+            new_state.set_fen(" ".join(fen_parts))
         elif i < len(tokens) and tokens[i] == "startpos":
-            i += 1  # startpos — board already at starting position
+            i += 1
 
         if i < len(tokens) and tokens[i] == "moves":
             i += 1
             while i < len(tokens):
-                board.push_uci(tokens[i])
+                new_state.push_uci(tokens[i])
                 i += 1
 
-        board_state = ChessBoardState(board)
-        cur_player = 1 if board.turn == chess.WHITE else -1
+        board_state = new_state
 
     def handle_go(_line: str) -> None:
-        # Fresh MCTS per move (no tree reuse — simple and correct)
+        is_black = board_state.side_to_move() == -1
+        cur_player = board_state.side_to_move()
         canonical = game.getCanonicalForm(board_state, cur_player)
         mcts = MCTS(game, nnet, args)
         probs = mcts.getActionProb(canonical, temp=0)
         action = int(np.argmax(probs))
 
-        raw_move = action_to_move(action)
-        if raw_move is None:
-            # Fallback: pick first legal move
-            raw_move = next(iter(board_state.board.legal_moves))
-            _log("Warning: action_to_move returned None, using first legal move")
-            print(f"bestmove {raw_move.uci()}", flush=True)
-            return
+        uci = action_to_uci(action, is_black=is_black)
+        if uci is None:
+            # Fallback: first valid action
+            valid = board_state.valid_moves_mask()
+            fallback = int(np.argmax(valid))
+            uci = action_to_uci(fallback, is_black=is_black) or "0000"
+            _log("Warning: top action not in table, using fallback")
 
-        real_move = _flip_move(raw_move) if board_state.board.turn == chess.BLACK else raw_move
-        print(f"bestmove {real_move.uci()}", flush=True)
+        print(f"bestmove {uci}", flush=True)
 
     # ── Main UCI loop ─────────────────────────────────────────────────────────
 

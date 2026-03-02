@@ -4,9 +4,24 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.13"
 dependencies = [
+    "build>=1.4.0",
     "numpy>=2.4.2",
-    "python-chess>=1.999",
+    "pybind11>=3.0.2",
+    "scikit-build-core>=0.12.1",
     "textual>=8.0.0",
     "torch>=2.10.0",
     "tqdm>=4.67.3",
 ]
+
+[project.optional-dependencies]
+ui = [
+    "python-chess>=1.999",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cuda" }
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
