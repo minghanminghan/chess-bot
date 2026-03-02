@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <array>
 #include <vector>
@@ -54,10 +55,14 @@ public:
 	~Stack() = default;
 
 	inline void push(const T& element) {
+		if (length >= Capacity)
+			throw std::overflow_error("Stack overflow: position history exceeded capacity (" + std::to_string(Capacity) + ")");
 		data[length++] = element;
 	}
 
 	inline void push(const T&& constructed_element) {
+		if (length >= Capacity)
+			throw std::overflow_error("Stack overflow: position history exceeded capacity (" + std::to_string(Capacity) + ")");
 		data[length++] = std::move(constructed_element);
 	}
 
@@ -934,7 +939,7 @@ private:
 	array<Bitboard, NPIECES> pieces{};
 	array<Piece, NSQUARES> board{};
 
-	static constexpr i16 POSITION_STATE_SIZE = 1000;
+	static constexpr i16 POSITION_STATE_SIZE = 4096;
 
 	Stack<PositionState, POSITION_STATE_SIZE> state_history{};
 
