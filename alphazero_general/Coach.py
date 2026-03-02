@@ -20,8 +20,8 @@ from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
-from Arena import Arena
-from MCTS import MCTS
+from alphazero_general.Arena import Arena
+from alphazero_general.MCTS import MCTS
 
 
 # ── Module-level worker (must be top-level for multiprocessing pickling) ──────
@@ -29,10 +29,10 @@ from MCTS import MCTS
 def _run_episode_worker(checkpoint_dir: str, checkpoint_file: str, args_dict: dict) -> list:
     """Spawned by ProcessPoolExecutor. Loads its own model copy, runs one episode."""
     import sys
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from chessbot.ChessGame import ChessGame
     from chessbot.ChessNNet import ChessNNet
-    from MCTS import MCTS
+    from alphazero_general.MCTS import MCTS
     from utils import dotdict
 
     args  = dotdict(args_dict)
