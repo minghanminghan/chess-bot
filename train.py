@@ -13,7 +13,10 @@ Usage:
       --num-channels 64 --num-res-blocks 4        # fast scale-down test
 
 Checkpoints are saved to ./checkpoints/ (or --checkpoint-dir) after each accepted
-model update. Training examples are saved as checkpoint_<iter>.examples.
+model update. Training examples are saved every --save-examples-every iterations.
+
+WSL note: if your project lives on /mnt/c/..., pass --checkpoint-dir ~/chess-bot-checkpoints
+to avoid writing through the slow Windows FS layer.
 """
 
 import argparse
@@ -59,12 +62,25 @@ args = dotdict({
     'num_res_blocks':  20,  # residual tower depth (AlphaZero: 20)
 
     # ── Arena / model acceptance ─────────────────────────────────────────────
-    'arenaCompare':      100,   # games per evaluation round
+    # 40 games: σ≈7.9% at p=0.5, sufficient to detect consistent improvement.
+    # 100 games adds little signal vs ~2.5× the wall-clock cost.
+    'arenaCompare':      40,    # games per evaluation round
     'updateThreshold':   0.55,  # min win-rate to accept new model
 
     # ── Example history ──────────────────────────────────────────────────────
-    'numItersForTrainExamplesHistory': 30,  # keep last 30 iters of examples
-    'maxlenOfQueue': 200_000,               # (informational; enforced via history)
+    # Memory budget: maxlenOfQueue × 48 KB ≈ peak RAM for the replay buffer.
+    #   20 000 examples →  ~1 GB    (tight, minimum viable)
+    #   50 000 examples →  ~2.4 GB  (comfortable on 8 GB systems)
+    #   200 000 examples → ~9.6 GB  (original default — only for 32+ GB RAM)
+    # numItersForTrainExamplesHistory is a secondary cap (oldest iteration dropped
+    # first); maxlenOfQueue is the hard ceiling enforced by total example count.
+    'numItersForTrainExamplesHistory': 10,
+    'maxlenOfQueue': 50_000,
+
+    # Save the full examples pickle every N iterations (not every iteration).
+    # Avoids a 500 MB–3 GB disk write on every iteration; crash recovery still
+    # works because the model checkpoint is saved every iteration.
+    'save_examples_every': 5,
 
     # ── Parallelism ───────────────────────────────────────────────────────────
     'num_workers':    1,        # parallel self-play workers (1 = sequential)
@@ -77,7 +93,8 @@ args = dotdict({
 # ── CLI overrides (for Colab / command-line use) ─────────────────────────────
 _cli = argparse.ArgumentParser(add_help=True)
 _cli.add_argument('--checkpoint-dir',  default=None,
-                  help='Checkpoint directory (e.g. /content/drive/MyDrive/chess-bot)')
+                  help='Checkpoint directory (default: ./checkpoints). '
+                       'In WSL, use ~/chess-bot-checkpoints to avoid slow /mnt/ I/O.')
 _cli.add_argument('--resume',          action='store_true',
                   help='Resume from best.pth.tar and saved examples')
 _cli.add_argument('--num-iters',       type=int, default=None)
@@ -85,27 +102,52 @@ _cli.add_argument('--num-eps',         type=int, default=None)
 _cli.add_argument('--mcts-sims',       type=int, default=None)
 _cli.add_argument('--num-channels',    type=int, default=None)
 _cli.add_argument('--num-res-blocks',  type=int, default=None)
-_cli.add_argument('--num-workers',      type=int, default=1,
+_cli.add_argument('--num-workers',     type=int, default=None,
                   help='Parallel self-play workers (1 = sequential)')
 _cli.add_argument('--mcts-batch-size', type=int, default=None,
-                  help='Leaves per GPU call in MCTS (default 8; try 32–128 on A100)')
+                  help='Leaves per GPU call in MCTS (default 64; try 128–256 on A100)')
+_cli.add_argument('--save-examples-every', type=int, default=None,
+                  help='Write training-examples pickle every N iterations (default 5)')
+_cli.add_argument('--max-queue',           type=int, default=None,
+                  help='Hard cap on total training examples kept in RAM '
+                       '(default 50000 ≈ 2.4 GB; ~48 KB per example)')
 _parsed = _cli.parse_args()
 
-if _parsed.checkpoint_dir:  args.checkpoint     = _parsed.checkpoint_dir
-if _parsed.num_iters:       args.numIters        = _parsed.num_iters
-if _parsed.num_eps:         args.numEps          = _parsed.num_eps
-if _parsed.mcts_sims:       args.numMCTSSims     = _parsed.mcts_sims
-if _parsed.num_channels:    args.num_channels    = _parsed.num_channels
-if _parsed.num_res_blocks:  args.num_res_blocks  = _parsed.num_res_blocks
-if _parsed.num_workers:       args.num_workers      = _parsed.num_workers
-if _parsed.mcts_batch_size:   args.mcts_batch_size  = _parsed.mcts_batch_size
+if _parsed.checkpoint_dir:      args.checkpoint          = _parsed.checkpoint_dir
+if _parsed.num_iters:            args.numIters            = _parsed.num_iters
+if _parsed.num_eps:              args.numEps              = _parsed.num_eps
+if _parsed.mcts_sims:            args.numMCTSSims         = _parsed.mcts_sims
+if _parsed.num_channels:         args.num_channels        = _parsed.num_channels
+if _parsed.num_res_blocks:       args.num_res_blocks      = _parsed.num_res_blocks
+if _parsed.num_workers is not None:     args.num_workers      = _parsed.num_workers
+if _parsed.mcts_batch_size:      args.mcts_batch_size     = _parsed.mcts_batch_size
+if _parsed.save_examples_every:  args.save_examples_every = _parsed.save_examples_every
+if _parsed.max_queue:            args.maxlenOfQueue       = _parsed.max_queue
 
 RESUME = _parsed.resume
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 
+def _warn_if_slow_checkpoint():
+    """Warn when running in WSL with checkpoints on the Windows FS (/mnt/)."""
+    try:
+        with open('/proc/version') as f:
+            if 'microsoft' not in f.read().lower():
+                return
+    except OSError:
+        return  # not Linux / not WSL
+    resolved = os.path.abspath(args.checkpoint)
+    if resolved.startswith('/mnt/'):
+        print(f"WARNING: checkpoint dir '{resolved}' is on the Windows FS (/mnt/).")
+        print("         Writes go through the NTFS driver and will be 3-5× slower.")
+        print("         Pass --checkpoint-dir ~/chess-bot-checkpoints for native speed.")
+        print()
+
+
 def main():
-    torch.set_float32_matmul_precision('high')   # enable TF32 for H100
+    torch.set_float32_matmul_precision('high')   # enable TF32 on Ampere+
+
+    _warn_if_slow_checkpoint()
 
     print("AlphaZero Chess — training run")
     print(f"  Iterations : {args.numIters}")
@@ -114,6 +156,11 @@ def main():
     print(f"  Network    : {args.num_res_blocks} res-blocks × {args.num_channels} channels")
     print(f"  Workers    : {args.num_workers}")
     print(f"  MCTS batch : {args.mcts_batch_size}")
+    print(f"  Arena      : {args.arenaCompare} games")
+    print(f"  Replay buf : {args.numItersForTrainExamplesHistory} iters / "
+          f"{args.maxlenOfQueue:,} examples max  "
+          f"(≈{args.maxlenOfQueue * 48 // 1024} MB peak, "
+          f"save every {args.save_examples_every} iters)")
     print(f"  Checkpoint : {args.checkpoint}")
     print(f"  Device     : {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
     print()

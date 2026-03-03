@@ -13,6 +13,7 @@ Training examples are (board_tensor, pi, v):
   v            : float ∈ [-1, 1]          — game outcome from that player's perspective
 """
 
+import gzip
 import os
 import pickle
 import numpy as np
@@ -155,10 +156,17 @@ class Coach:
 
                 self.trainExamplesHistory.append(iteration_examples)
 
-            if len(self.trainExamplesHistory) > self.args.numItersForTrainExamplesHistory:
+            while len(self.trainExamplesHistory) > self.args.numItersForTrainExamplesHistory:
+                self.trainExamplesHistory.pop(0)
+            # Hard-cap total example count so long games (stronger network) don't
+            # cause unbounded growth beyond phase-1 warmup.
+            max_q = self.args.get('maxlenOfQueue', 200_000)
+            while (sum(len(e) for e in self.trainExamplesHistory) > max_q
+                   and len(self.trainExamplesHistory) > 1):
                 self.trainExamplesHistory.pop(0)
 
-            self.saveTrainExamples(i - 1)
+            if i % self.args.get('save_examples_every', 1) == 0:
+                self.saveTrainExamples(i - 1)
 
             # Flatten and shuffle all historical examples
             train_examples = []
@@ -199,16 +207,23 @@ class Coach:
     def saveTrainExamples(self, iteration: int):
         os.makedirs(self.args.checkpoint, exist_ok=True)
         path = os.path.join(
-            self.args.checkpoint, f"checkpoint_{iteration}.examples"
+            self.args.checkpoint, f"checkpoint_{iteration}.examples.gz"
         )
-        with open(path, "wb") as f:
-            pickle.dump(self.trainExamplesHistory, f)
+        with gzip.open(path, "wb") as f:
+            pickle.dump(self.trainExamplesHistory, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     def loadTrainExamples(self):
-        model_file = os.path.join(self.args.checkpoint, 'best.pth.tar')
-        examples_file = model_file + ".examples"
-        if not os.path.isfile(examples_file):
+        import glob
+        # Accept both compressed (.gz) and legacy uncompressed files.
+        files = sorted(
+            glob.glob(os.path.join(self.args.checkpoint, "checkpoint_*.examples.gz")) +
+            glob.glob(os.path.join(self.args.checkpoint, "checkpoint_*.examples"))
+        )
+        if not files:
             return
-        with open(examples_file, "rb") as f:
+        examples_file = files[-1]   # most recent
+        print(f"Loading training examples from {examples_file}")
+        opener = gzip.open if examples_file.endswith(".gz") else open
+        with opener(examples_file, "rb") as f:
             self.trainExamplesHistory = pickle.load(f)
         self.skipFirstSelfPlay = True
